@@ -56,13 +56,46 @@ def _is_retryable_status_error(exception: BaseException) -> bool:
     return False
 
 
+def _is_in_flight_budget_error(exception: BaseException) -> bool:
+    """402 caused by OpenRouter's in-flight credit reservation, not by an empty balance.
+
+    v3a-infra: OpenRouter reserves credit for every in-flight request at its maximum
+    possible cost. Under concurrency this returns 402 `in_flight_budget_exhausted` with a
+    Retry-After header. It clears once other requests settle, so it is transient. A
+    plain 402 (actually out of credits) still fails fast.
+    """
+    return (
+        isinstance(exception, httpx.HTTPStatusError)
+        and exception.response.status_code == 402
+        and "in_flight_budget_exhausted" in str(exception)
+    )
+
+
 def _is_retryable_error(exception: BaseException) -> bool:
     """Check if the exception is retryable (retryable HTTP status or read timeout)."""
     return (
         _is_rate_limit_error(exception)
         or _is_retryable_status_error(exception)
+        or _is_in_flight_budget_error(exception)
         or _is_read_timeout_error(exception)
     )
+
+
+_exponential_wait = wait_exponential(multiplier=1, min=1, max=60)
+
+
+def _retry_wait(retry_state: RetryCallState) -> float:
+    """Exponential backoff, but honor Retry-After (capped) for in-flight budget 402s."""
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    if exc is not None and _is_in_flight_budget_error(exc):
+        assert isinstance(exc, httpx.HTTPStatusError)
+        try:
+            retry_after = float(exc.response.headers.get("Retry-After", "30"))
+        except ValueError:
+            retry_after = 30.0
+        return min(max(retry_after, 5.0), 120.0)
+    return _exponential_wait(retry_state)
 
 
 def _log_retry(retry_state: RetryCallState) -> None:
@@ -107,7 +140,11 @@ class OpenRouterConfig:
 
     model: str = "openai/gpt-oss-120b:nitro"
     api_key: str = ""
-    max_tokens: int = 100000
+    # v3a-infra: was 100000. OpenRouter reserves credit per in-flight request at
+    # max_tokens, so 16 workers x 100k tokens exhausted the in-flight budget (HTTP 402
+    # in_flight_budget_exhausted on ~95% of requests). Observed completions per
+    # generation in v2: median 169, p99 945, max 1,563. 16k leaves 10x headroom.
+    max_tokens: int = 16384
     temperature: float = 0.6
     max_iterations: int = 30
     # Provider routing - no restriction by default
@@ -223,7 +260,7 @@ class OpenRouterClient:
         retryer = Retrying(
             retry=retry_if_exception(_is_retryable_error),
             stop=stop_after_attempt(5),
-            wait=wait_exponential(multiplier=1, min=1, max=60),
+            wait=_retry_wait,  # v3a-infra: honors Retry-After for in-flight budget 402s
             before_sleep=_log_retry,  # v0: make provider retries visible
             reraise=True,
         )

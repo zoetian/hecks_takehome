@@ -58,3 +58,19 @@ def test_missing_id_is_synthesized() -> None:
     body = _sse({"index": 0, "function": {"name": "list_schemas", "arguments": "{}"}})
     calls = _stream_tool_calls(body)
     assert len(calls) == 1 and calls[0]["id"]
+
+
+def _status_error(code: int, body: str) -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", "https://x")
+    resp = httpx.Response(code, request=req, headers={"Retry-After": "120"})
+    return httpx.HTTPStatusError(f"HTTP {code} from OpenRouter: {body}", request=req,
+                                 response=resp)
+
+
+def test_in_flight_budget_402_is_retryable_but_plain_402_is_not() -> None:
+    from framework.llm import _is_retryable_error
+
+    assert _is_retryable_error(_status_error(402, '{"reason":"in_flight_budget_exhausted"}'))
+    assert not _is_retryable_error(_status_error(402, '{"message":"Insufficient credits"}'))
+    assert not _is_retryable_error(_status_error(400, "bad request"))
+    assert not _is_retryable_error(_status_error(401, "bad key"))
