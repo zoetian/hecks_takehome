@@ -6,6 +6,7 @@ streaming chat completions with tool calling.
 
 import json
 import logging
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,12 +40,13 @@ def _is_read_timeout_error(exception: BaseException) -> bool:
 
 
 # v0: fix provider error handling under concurrency.
-# Transient upstream/provider errors (OpenRouter surfaces
-# some of these as 400) rather than a malformed request, so we retry them along
-# with 408 and 5xx. Requests that are genuinely bad still fail after the retry
-# budget, and the response body is now included in the error (see
-# _raise_for_status_with_body) so the cause shows up in eval traces.
-_RETRYABLE_STATUS_CODES = {400, 408, 429, 500, 502, 503, 504}
+# Retry transient upstream/provider errors: 408, 429, and 5xx. The response body is
+# now included in the error (see _raise_for_status_with_body) so the cause shows up
+# in eval traces.
+# v1: 400 removed from the retry set. The v0 400s turned out to be deterministic
+# (an empty tool_call_id caused by a tool-call streaming bug, fixed in v1), so
+# retrying only added ~15s of backoff before the same failure. A 400 now fails fast.
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def _is_retryable_status_error(exception: BaseException) -> bool:
@@ -237,6 +239,8 @@ class OpenRouterClient:
 
                         # Accumulated tool call data (streamed incrementally)
                         tool_calls_buffer: dict[int, dict[str, Any]] = {}
+                        # v1: maps a provider's spurious continuation index to the real one
+                        index_alias: dict[int, int] = {}
 
                         for line in response.iter_lines():
                             # Skip empty lines and comments
@@ -281,6 +285,25 @@ class OpenRouterClient:
                             if "tool_calls" in delta and delta["tool_calls"]:
                                 for tc in delta["tool_calls"]:
                                     idx = tc.get("index", 0)
+                                    # v1: some providers (seen: Nebius) emit the tail of a
+                                    # call's arguments under a NEW index with an empty id
+                                    # and name, e.g. a lone "}". Treating it as a separate
+                                    # call breaks both calls: the first gets invalid JSON,
+                                    # and the phantom one has an empty tool_call_id, which
+                                    # makes the next request fail with 400. A new index
+                                    # without an id or name is a continuation, so route it
+                                    # to the previous call.
+                                    idx = index_alias.get(idx, idx)
+                                    func_delta = tc.get("function") or {}
+                                    if (
+                                        idx not in tool_calls_buffer
+                                        and tool_calls_buffer
+                                        and not tc.get("id")
+                                        and not func_delta.get("name")
+                                    ):
+                                        last_idx = max(tool_calls_buffer)
+                                        index_alias[idx] = last_idx
+                                        idx = last_idx
                                     if idx not in tool_calls_buffer:
                                         tool_calls_buffer[idx] = {
                                             "id": tc.get("id", ""),
@@ -308,6 +331,12 @@ class OpenRouterClient:
                                     tool_calls_buffer[i]
                                     for i in sorted(tool_calls_buffer.keys())
                                 ]
+                                # v1: the API rejects tool messages with an empty
+                                # tool_call_id, so fill in a synthetic id if the
+                                # provider never sent one.
+                                for call in chunk.tool_calls:
+                                    if not call["id"]:
+                                        call["id"] = f"call_{uuid.uuid4().hex[:24]}"
 
                             # Parse usage data if present (comes in final chunk)
                             if "usage" in data and data["usage"]:

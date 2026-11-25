@@ -14,6 +14,7 @@ from rich.prompt import Prompt
 from framework.agent import Agent, Tool
 from framework.llm import OpenRouterConfig
 from framework.stream_printer import StreamPrinter
+from tools.database_tools import DATABASE_TOOLS
 from tools.submit_answer import SUBMIT_ANSWER
 
 
@@ -25,7 +26,8 @@ def create_tools() -> dict[str, Tool]:
     """
     return {
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
-        # You can add your own tools here to test!
+        # v1: schema discovery + SQL execution
+        **{tool.name: tool for tool in DATABASE_TOOLS},
     }
 
 
