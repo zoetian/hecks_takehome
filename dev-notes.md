@@ -60,7 +60,8 @@ change.
 |-----|--------|------|------|----------------------------|------|
 | v0 baseline | d76b1c9 | 7/64 (10.9%) | 0/64 (0.0%) | easy 20k/27k, hard 23k/25k | `run_20261125_061236`, `run_20261125_061608` |
 | v0 + error handling | 892af65 | not run separately | — | — | Validated as part of v1 |
-| v1 tools + tool-call stream fix | TBD | 57/64 (89.1%) | 20/64 (31.2%) | easy 1.55M/113k, hard 1.64M/84k | `run_20261125_070338` |
+| v1 tools + tool-call stream fix | 0a0e8ca | 57/64 (89.1%) | 20/64 (31.2%) | easy 1.55M/113k, hard 1.64M/84k | `run_20261125_070338` |
+| v2 guide index + read/search guides | TBD | 54/64 (84.4%) | 51/64 (79.7%) | easy 2.35M/103k, hard 2.68M/92k | `run_20261125_080612` |
 
 ---
 
@@ -349,7 +350,7 @@ Known limitation: v0's "explore by submitting information_schema" cases show up 
 
 ---
 
-## v2 — Business-rule guides (proposed, not implemented)
+## v2 — Business-rule guides (implemented, pending eval)
 
 ### Current result
 - v1: easy 57/64 (89.1%), hard 20/64 (31.2%).
@@ -402,6 +403,115 @@ Risks:
 - Index-in-prompt scales poorly to hundreds of guides. For this warehouse (49) it is
   fine. The write-up should note that a larger corpus would need retrieval.
 
+**Decision:** put the index in the system prompt (rather than a `list_guides` tool).
+
+### Implementation notes
+- `framework/agent.py`: `Tool` gets an optional `prompt_context` field, and the system
+  message appends every tool's context. `evaluate.py` builds `Agent(config, tools)` and
+  we may only change `create_tools()`, so a tool is the only channel for adding standing
+  context. This keeps the framework generic: it knows nothing about guides.
+- `tools/guide_tools.py`: `read_guide(names=[...])` (up to 4, full text) carries the
+  index plus guidance rules as its `prompt_context`. `search_guides(query)` returns up to
+  40 matching lines with `[guide / section]`.
+- System prompt is now ~2.4k tokens, of which ~2k is the index.
+- Smoke test on 3 v1-failing hard cases: #2 (credit $0.01 rule) PASS, #8 (legacy
+  workforce) PASS, #0 (airline on-time) FAIL. In #0 the model ran
+  `search_guides("on-time")`, used the snippet, and never read the full airline guide,
+  so it missed the "completed" and WeatherDelay rules in the same guide. Fix:
+  `search_guides` output now ends with a nudge to read the full candidate guides before
+  writing SQL.
+
+### Result after change
+- **Hard: 51/64 (79.7%)**, up from 20/64: +32 fixed, 1 regressed. **Easy: 54/64
+  (84.4%)**, down from 57/64: +2 fixed, 5 regressed. Logs: `run_20261125_080612`.
+- Cost: ~5.0M tokens for both splits, vs 3.2M in v1. The 2k-token index is resent on
+  every turn (~6.5 turns/case).
+
+### Failure analysis (via `scripts/debug_eval.py`)
+
+**Hard, 13 failures, grouped by root cause:**
+
+| Root cause | Cases | Detail |
+|---|---|---|
+| Searched but never read the full guide | #4, #53, #57 | `search_guides` only, so it missed rules from the same guide ($0.01 exclusion, "completed" = Dep/ArrTime present). The nudge in the search output was not enough. |
+| Read the guide, applied it incompletely | #0, #5, #20, #29 | #0 read `airline_operations` and still missed "completed". #20 used `constructorResults` instead of individual results. #5 is a complex multi-step grouping rule. #29 hit the NULL pitfall below. |
+| Used no guide at all | #46, #49, #63 | Chess, F1, and Hockey questions where the agent never searched or read a guide. |
+| Wrong look-alike schema | #3, #6 | #3: `search_guides("transaction value")` led to `financial_operations`, so it used `financial.trans` instead of `Credit.charge`. #6: read the financial guide but still used `cs`. |
+| Submitted untested SQL | #9 | Binder error; regressed from v1 PASS. |
+
+Cross-cutting **SQL NULL pitfall**: `charge_code <> 'RF'` silently drops NULL codes,
+although the rule says "NULL codes are purchases". The correct form is
+`charge_code IS DISTINCT FROM 'RF'`. Seen in hard #29 and #57, and in easy #57.
+
+**Easy regressions (5): mostly not caused by guides.**
+- #15 (chess win rate): misread "draws count as games in the denominator" and used
+  wins+draws as the denominator. Did not read a guide.
+- #40 (thin routes): guide-induced. `search_guides("completed flight definition")` → the
+  guide says "diverted flights count as completed", so the agent added
+  `OR Diverted = 1` even though the question defines completed explicitly. This is the
+  over-application risk we flagged.
+- #48 (production breweries): grouped by brewery id where gold groups by name. A
+  grouping-key ambiguity.
+- #57 (long-tail providers): the NULL pitfall above.
+- #59 (starting pitchers): different top-50 membership with the same stated filters.
+  Ranking or tie-break detail. Did not read a guide.
+
+Only 1 of the 5 regressions is clearly guide-induced. The others look like
+instruction-reading or SQL errors that occur stochastically (temperature 0.6). With 64
+cases, ±3 is plausibly noise. **We need repeated runs to tell signal from noise.**
+
+Takeaways:
+- v2 delivered the big structural gain (hard +31 cases). Remaining failures are about
+  *how reliably* the agent uses the guides, plus a few generic SQL and validation issues.
+- Easy ≈ hard now (84% vs 80%). The agent reaches roughly the same accuracy whether or
+  not the rules are spelled out in the prompt.
+
+---
+
+## v3 — Reliable guide use + validation (proposed, not implemented)
+
+### Current result
+- v2: easy 54/64 (84.4%), hard 51/64 (79.7%).
+
+### Proposed changes (ranked by expected impact / cost)
+
+1. **Pre-submit validation in `submit_answer`** (fixes #9-type failures).
+   `submit_answer` executes the query first. If it errors, the tool returns the error
+   instead of `ANSWER_SUBMITTED:`, so the episode continues and the agent fixes it. The
+   tool is stateless, so this is safe under concurrency. Low risk.
+2. **Make reading the full guide a required step** (targets the 3 search-only and 3
+   no-guide cases). Two options:
+   - (a) Prompt-only: restructure the workflow as a numbered checklist with "read the
+     full guide for the chosen schema, even if search found the term" as a mandatory
+     step.
+   - (b) Structural: `search_guides` returns the full text of the top-matching guide(s)
+     instead of fragments, which removes the "snippet only" failure mode. Guides are
+     small, so the cost is ~1k tokens per search.
+   Recommendation: (b) plus a lighter version of (a). (b) is generic and does not depend
+   on the model obeying.
+3. **Rule checklist before submitting** (targets "read but applied incompletely":
+   #0, #20, #29). Instruct the model to list, in its reasoning, every guide definition
+   that applies to a term in the question and map each one to a SQL clause, then check
+   the query against that list before calling submit_answer.
+4. **Generic SQL pitfalls in the system prompt** (NULL pitfall #29, #57, easy #57;
+   GROUP BY alias from v1):
+   - Excluding a value from a nullable column: use `IS DISTINCT FROM`; `col <> 'X'`
+     drops NULLs.
+   - GROUP BY / ORDER BY an output alias that shadows an input column binds to the
+     column: group by the full expression.
+   - Do not round unless asked; keep the row grain the question asks for.
+5. **Schema disambiguation rule** (#3, #6): "When several schemas look alike, use the
+   database named in the relevant guide's title, and verify with describe_table that the
+   columns match the guide's vocabulary."
+6. **Question beats guide**, made more explicit (easy #40): when the question itself
+   defines a term, use the question's definition verbatim and do not add guide
+   qualifiers to it.
+
+### Measurement plan
+- Run v3 **twice** (both splits) and report the mean and range. Also rerun v2 once more
+  if budget allows, so the v2→v3 delta is not just noise.
+- Watch: easy regressions, guide over-application, token cost (option 2b adds tokens).
+
 ### Result after change
 - TBD
 
@@ -411,8 +521,7 @@ Risks:
 
 | Ver | Change | Target |
 |-----|--------|--------|
-| v3 | System prompt: explicit workflow (locate schema → read guide → explore → validate → submit); generic output conventions derived from the scoring rules; literal adherence to stated definitions; result sanity checks (from v1: 100% for every carrier); SQL pitfalls such as GROUP BY alias shadowing | Hard → 70%+ |
-| v4 | Failure-driven fixes: move the trace-analysis script into the repo; pre-submit SQL validation (from v1: 1 untested submit); loop and iteration control (from v1: 2 max-iteration failures); reasoning effort; timeout | Hard → 80–90% |
+| v4 | Leftovers after v3: loop and iteration control (max-iteration failures); reasoning effort; `first_token_timeout` check (deferred until ~70%, now reached); context compression for token cost | Hard → 85–90% |
 
 Noise: temperature 0.6 and 64 cases (1 case ≈ 1.6%). Run key versions ≥2 times and
 report a range.

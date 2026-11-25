@@ -15,6 +15,7 @@ from framework.agent import Agent, Tool
 from framework.llm import OpenRouterConfig
 from framework.stream_printer import StreamPrinter
 from tools.database_tools import DATABASE_TOOLS
+from tools.guide_tools import GUIDE_TOOLS
 from tools.submit_answer import SUBMIT_ANSWER
 
 
@@ -28,6 +29,8 @@ def create_tools() -> dict[str, Tool]:
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
         # v1: schema discovery + SQL execution
         **{tool.name: tool for tool in DATABASE_TOOLS},
+        # v2: business-rule guides (index goes into the system prompt)
+        **{tool.name: tool for tool in GUIDE_TOOLS},
     }
 
 

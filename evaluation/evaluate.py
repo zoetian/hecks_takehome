@@ -50,6 +50,7 @@ from framework.agent import ANSWER_SUBMITTED_PREFIX, Agent, AgentEvent, EventTyp
 from framework.database import execute_query
 from framework.llm import OpenRouterConfig, TokenUsage
 from tools.database_tools import DATABASE_TOOLS
+from tools.guide_tools import GUIDE_TOOLS
 from tools.submit_answer import SUBMIT_ANSWER
 
 # =============================================================================
@@ -148,6 +149,8 @@ def create_tools() -> dict[str, Tool]:
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
         # v1: schema discovery + SQL execution
         **{tool.name: tool for tool in DATABASE_TOOLS},
+        # v2: business-rule guides (index goes into the system prompt)
+        **{tool.name: tool for tool in GUIDE_TOOLS},
     }
 
 

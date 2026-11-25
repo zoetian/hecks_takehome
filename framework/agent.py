@@ -66,6 +66,10 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     function: ToolFunction
+    # v2: optional text the tool contributes to the system prompt (e.g. an index of the
+    # documents it can read). This lets tools add standing context without the framework
+    # knowing about them, and without changing how evaluate.py constructs the Agent.
+    prompt_context: str | None = None
 
 
 @dataclass
@@ -343,7 +347,13 @@ class Agent:
         yield AgentEvent(type=EventType.GENERATION_END, data=event_data)
 
     def _get_system_message(self) -> str:
-        """Get the system message for the agent."""
+        """Get the system message for the agent, plus any context contributed by tools."""
+        base = self._base_system_message()
+        # v2: append standing context from tools (e.g. the business-rule guide index).
+        contexts = [t.prompt_context for t in self.tools.values() if t.prompt_context]
+        return "\n\n".join([base, *contexts])
+
+    def _base_system_message(self) -> str:
         return (
             "You are an autonomous SQL agent. You must complete tasks independently "
             "without asking the user for clarification or additional information. "
