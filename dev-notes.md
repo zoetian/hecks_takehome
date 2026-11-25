@@ -468,7 +468,11 @@ Takeaways:
 
 ---
 
-## v3 — Reliable guide use + validation (proposed, not implemented)
+## v3 — Reliable guide use + validation
+
+Split into two steps so each kind of change can be measured on its own:
+- **v3a** = structural/tooling (①②④), implemented.
+- **v3b** = prompt-only behavior (③⑤⑥), not yet.
 
 ### Current result
 - v2: easy 54/64 (84.4%), hard 51/64 (79.7%).
@@ -511,9 +515,94 @@ Takeaways:
 - Run v3 **twice** (both splits) and report the mean and range. Also rerun v2 once more
   if budget allows, so the v2→v3 delta is not just noise.
 - Watch: easy regressions, guide over-application, token cost (option 2b adds tokens).
+- Token numbers here are OpenRouter (agent) tokens, i.e. what `uv run evaluate` prints,
+  billed to the eval key. Claude Code's own usage while developing is separate.
+
+### v3a implementation notes (①②④)
+- ① `tools/submit_answer.py`: executes the query before accepting it. On error it
+  returns "Submission rejected ..." plus the DuckDB error, without the
+  `ANSWER_SUBMITTED:` prefix, so the episode continues and the agent can fix the query.
+  Stateless, so it is safe under concurrency. Side fix in `framework/database.py`:
+  `execute_query` raised `UnboundLocalError` from `finally` if `connect()` failed.
+- ② `tools/guide_tools.py::search_guides`: results now include the full text of the
+  top-2 guides (~2k tokens), not only the matching lines (cut to 15). Ranking was
+  improved at the same time, since a wrong top guide now costs more:
+  - IDF term weights, so common words like "time" do not dominate.
+  - Whole-phrase bonus.
+  - Whole-word matching with plural folding. Previously "win" substring-matched
+    "wine".
+  - Guides are ranked by their best-matching line plus 0.1 × total, so a guide that
+    repeats a common word does not beat one with the exact phrase. On 17 typical
+    queries, the relevant guide is in the top 2 for all 17.
+- ④ `framework/agent.py` system prompt adds generic SQL pitfalls: NULL with
+  `<>`/`NOT IN` (use `IS DISTINCT FROM`); output alias shadowing an input column in
+  GROUP BY; no rounding unless asked and keep the row grain; sanity-check implausible
+  results.
+- Tests: `tests/test_tools.py` (submit accepts and rejects; search includes full guide
+  text). 12 tests pass.
+- Smoke test on 4 v2 hard failures (#9 untested SQL; #4, #53, #57 search-only): 4/4
+  PASS (n=1 each). #9 passed on its first submit, so the rejection path was not
+  exercised in that test.
 
 ### Result after change
-- TBD
+- **v3a (1 run, `run_20261125_084027`): easy 55/64 (85.9%), hard 52/64 (81.2%)**, vs v2
+  54/64 and 51/64. 0 infra failures: two in-flight 402s were retried successfully by
+  the infra fix. Tokens 5.06M in / 0.20M out, about the same as v2. Only one run, to
+  save budget.
+- The targeted mechanisms worked on their target cases:
+  - hard #9 (untested SQL) now passes, and 1 submission across the run was rejected and
+    then fixed.
+  - #4 and #57 (search-only) pass.
+  - #29 and #57 (NULL pitfall) pass; 20 submitted queries now use `IS DISTINCT FROM`.
+  - #6 (wrong schema) passes on both splits.
+- **But the net change is only +1 per split, because of high churn:** hard had 8 fixed
+  and 7 regressed; easy had 3 fixed and 2 regressed.
+- Hard regressions: 3 of 7 (#21, #22, #24) never consulted any guide in this run, even
+  though they passed in v2 when they did. #7, #41, #43, #55 read or searched a guide but
+  applied it partly (e.g. #7 missed `status = 'A'` for "performing"). None is clearly
+  caused by a v3a mechanism. They look like run-to-run variance in *whether and how* the
+  agent uses guides.
+- v3b: TBD
+
+### Key finding: run-to-run variance now dominates
+- Between v2 and v3a, 15 of 64 hard cases flipped (8 fixed, 7 regressed) for a net of +1.
+  At temperature 0.6 a single run cannot resolve improvements of a few cases.
+- The largest remaining failure mode is **inconsistent guide consultation**: the same
+  question sometimes reads the right guide and sometimes reads none. Prompt rules alone
+  ("read the guide first") are followed only stochastically.
+- Implications:
+  1. The next change should make guide exposure *structural*, not optional.
+  2. Lowering temperature is a cheap variance reducer worth testing.
+  3. Single-run deltas of ±3 should not be reported as real effects.
+
+### Incident: 3 invalid v3a runs (HTTP 402)
+- Runs `run_20261125_082127`, `_082255`, `_082424` are **invalid**: ~120/128 cases per run
+  failed with
+  `HTTP 402 in_flight_budget_exhausted` ("This request would exceed your available
+  credits given your current in-flight requests", Retry-After 120 s). They were later
+  deleted from `logs/`, along with a 4th partial run (`_082949`) that was stopped after
+  the infra fix still hit 402s (the account's credit balance was low; the user topped
+  up).
+- Note: "No limit set" on a key is a *spending limit*. The in-flight budget is bounded
+  by the account's *credit balance* (plus a platform ceiling), so a key with no limit can
+  still be capped.
+- Mechanism: OpenRouter reserves credit for each in-flight request at its *maximum*
+  possible cost. We send `max_tokens=100000` with 16 concurrent workers, i.e. we reserve
+  room for ~1.6M output tokens at once.
+- Actual need (v2 traces, 814 generations): median 169, p99 945, **max 1,563**
+  completion tokens per generation. The reservation is ~64× larger than anything we use.
+- Candidate fixes (infra, not agent behavior):
+  1. Lower the `max_tokens` default to 16,384 (10× the observed max).
+  2. Optionally retry this specific 402 (`in_flight_budget_exhausted`) using its
+     Retry-After. A plain 402 (truly out of credits) should still fail fast.
+  3. Lower concurrency if the balance is low.
+- Also worth checking: the remaining credit balance on the key.
+- Two different keys failed the same way: the first run used the user's own key, the
+  other two the provided key. All three show only `in_flight_budget_exhausted`
+  (121/124/123 of 128 cases). So the request pattern (`max_tokens=100000` × 16
+  concurrent), not a single key's balance, is the common factor. The 4–7 cases per run
+  that completed were presumably requests that happened to get budget while others
+  settled.
 
 ---
 

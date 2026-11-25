@@ -87,6 +87,9 @@ def execute_query(query: str) -> QueryExecutionResult:
         ... else:
         ...     print(f"Error: {result.error_message}")
     """
+    # v3a: initialize conn so a failed connect() returns an error instead of raising
+    # UnboundLocalError from the finally block (submit_answer now runs queries too).
+    conn: duckdb.DuckDBPyConnection | None = None
     try:
         conn = duckdb.connect(str(DATABASE_PATH), read_only=True)
         result = conn.execute(query)
@@ -97,7 +100,8 @@ def execute_query(query: str) -> QueryExecutionResult:
     except Exception as e:
         return QueryExecutionResult(dataframe=None, error_message=str(e))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 # Helper functions for listing schemas and tables

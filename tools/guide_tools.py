@@ -18,6 +18,7 @@ Everything is derived from whatever markdown files are in the guides directory; 
 is specific to these guides. Override the location with HECKS_GUIDES_DIR.
 """
 
+import math
 import os
 import re
 from pathlib import Path
@@ -30,7 +31,8 @@ GUIDES_DIR = Path(
         Path(__file__).resolve().parent.parent / "evaluation" / "data" / "guides",
     )
 )
-_MAX_SEARCH_HITS = 40
+_MAX_SEARCH_HITS = 15
+_FULL_GUIDES_IN_SEARCH = 2  # v3a: full text of the top-N guides is appended to results
 _MAX_GUIDES_PER_READ = 4
 
 
@@ -150,16 +152,40 @@ def search_guides(query: str) -> str:
     terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
     if not terms:
         return "Error: provide one or more keywords (3+ characters)."
-    hits: list[tuple[int, str, str, str]] = []
-    for name, path in _guide_files().items():
+    phrase = " ".join(re.findall(r"\w+", query.lower()))
+    texts = {name: path.read_text() for name, path in _guide_files().items()}
+    # v3a: IDF weighting so common words ("time", "data") don't dominate, plus a bonus
+    # for the whole phrase. With full guides returned, ranking quality matters more.
+    n_docs = max(len(texts), 1)
+
+    def tokens(s: str) -> set[str]:
+        # Whole-word matching with naive plural folding ("wins" -> "win"), so that
+        # "win" no longer matches "wine" as a substring would.
+        out = set()
+        for tok in re.findall(r"\w+", s.lower()):
+            out.add(tok)
+            for suffix in ("es", "s"):
+                if tok.endswith(suffix) and len(tok) > len(suffix) + 2:
+                    out.add(tok[: -len(suffix)])
+        return out
+
+    doc_tokens = {name: tokens(txt) for name, txt in texts.items()}
+    idf = {
+        t: math.log((n_docs + 1) / (1 + sum(t in toks for toks in doc_tokens.values())))
+        for t in terms
+    }
+    hits: list[tuple[float, str, str, str]] = []
+    for name, text in texts.items():
         section = ""
-        for line in path.read_text().splitlines():
+        for line in text.splitlines():
             if line.startswith("#"):
                 section = line.lstrip("#").strip()
                 continue
-            low = line.lower()
-            score = sum(1 for t in terms if t in low)
-            if score:
+            line_tokens = tokens(line)
+            score = sum(idf[t] for t in set(terms) if t in line_tokens)
+            if len(terms) > 1 and phrase in " ".join(re.findall(r"\w+", line.lower())):
+                score *= 2
+            if score > 0:
                 hits.append((score, name, section, line.strip()))
     if not hits:
         return f"No guide lines match {terms}."
@@ -167,23 +193,33 @@ def search_guides(query: str) -> str:
     shown = hits[:_MAX_SEARCH_HITS]
     lines = [f"[{name} / {section}] {text}" for _, name, section, text in shown]
     more = f"\n({len(hits) - len(shown)} more matches not shown)" if len(hits) > len(shown) else ""
-    guides = sorted({name for _, name, _, _ in shown})
-    # Smoke test (hard #0): the model used a search snippet for "on-time" and skipped
-    # the rest of the guide, missing the "completed flight" and weather rules next to it.
-    nudge = (
-        "\nThese are fragments only. Related definitions usually sit elsewhere in the same "
-        f"guide: read the relevant guide(s) in full with read_guide (candidates: "
-        f"{', '.join(guides)}) before writing SQL."
+
+    # v3a: also return the FULL text of the best-matching guides. In v2, 3 hard failures
+    # used only the search fragments and never read the full guide, so they missed
+    # definitions that sat next to the matched line (a nudge in the output was not
+    # enough). Guides are short (~1k tokens), so returning the top ones whole removes
+    # this failure mode structurally.
+    # Rank guides by their best line, with a small bonus for breadth, so a guide that
+    # mentions a common word many times does not outrank one with the exact phrase.
+    best: dict[str, float] = {}
+    total: dict[str, float] = {}
+    for score, name, _, _ in hits:
+        best[name] = max(best.get(name, 0.0), score)
+        total[name] = total.get(name, 0.0) + score
+    guide_score = {n: best[n] + 0.1 * total[n] for n in best}
+    top = sorted(guide_score, key=lambda n: -guide_score[n])[:_FULL_GUIDES_IN_SEARCH]
+    return (
+        f"{len(hits)} matching lines (best first):\n" + "\n".join(lines) + more
+        + "\n\nFull text of the best-matching guide(s). Apply the definitions relevant to "
+        "the question, not just the matched lines:\n\n" + read_guide(top)
     )
-    return f"{len(hits)} matching lines (best first):\n" + "\n".join(lines) + more + nudge
 
 
 SEARCH_GUIDES: Tool = Tool(
     name="search_guides",
     description=(
         "Keyword search across all business-rule guides. Returns matching lines with "
-        "their guide and section. Use it to find where a term is defined; then read that "
-        "guide in full with read_guide."
+        "their guide and section, plus the full text of the best-matching guide(s)."
     ),
     parameters={
         "type": "object",
