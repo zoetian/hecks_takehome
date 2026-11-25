@@ -4,18 +4,23 @@ Reads the trace files written by `uv run evaluate` (logs/run_*/evals_{easy,hard}
 re-executes the gold and submitted SQL (traces do not store dataframes), and classifies
 each failure. It never changes evaluate.py or the agent; it is a read-only debugging aid.
 
-Usage:
-    uv run python scripts/debug_eval.py summary [RUN_DIR] [--split hard] [--label v1]
-    uv run python scripts/debug_eval.py case    [RUN_DIR] CASE [--split hard] [--thinking]
+Usage (everything defaults to the latest run, so no paths are needed day to day):
+    uv run python scripts/debug_eval.py summary --label v2          # latest run
+    uv run python scripts/debug_eval.py case 12 [--split hard] [--thinking]
+    uv run python scripts/debug_eval.py diff                        # latest vs previous version
     uv run python scripts/debug_eval.py history
-    uv run python scripts/debug_eval.py diff    RUN_A RUN_B [--split hard]
 
-RUN_DIR defaults to the latest logs/run_*. CASE is the 0-based index in the eval file
-(the `#` column in `summary`) or a trace-id prefix.
+RUN_DIR (optional everywhere) defaults to the latest logs/run_* that contains the split.
+CASE is the 0-based index in the eval file (the `#` column in `summary`) or a trace-id
+prefix.
+
+diff picks runs automatically per split: B = latest run, A = the latest earlier run
+whose --label differs from B's (reruns of the same version are skipped; without labels
+it falls back to the run just before B). `diff RUN_B` or `diff RUN_A RUN_B` override.
 
 Every report is printed to the terminal and also saved under RUN_DIR/debug/:
     summary_<split>.txt / summary_<split>.json   (json doubles as a diagnosis cache)
-    case_<split>_<NN>.txt
+    case_<split>_<NN>.txt, diff.txt
 """
 
 from __future__ import annotations
@@ -53,11 +58,41 @@ TOLERANCE = Decimal("0.0001")
 # =============================================================================
 
 
-def latest_run() -> Path:
+def all_runs(split: str | None = None) -> list[Path]:
+    """Run dirs sorted oldest → newest (names are UTC timestamps), optionally only those
+    that contain traces for `split` (easy and hard may have been run separately)."""
     runs = sorted(p for p in LOGS.glob("run_*") if p.is_dir())
+    if split is not None:
+        runs = [p for p in runs if any((p / split).glob("*.json"))]
+    return runs
+
+
+def latest_run(split: str | None = None) -> Path:
+    runs = all_runs(split)
     if not runs:
-        sys.exit("No runs found under logs/. Run `uv run evaluate` first.")
+        sys.exit(f"No runs{f' with {split}' if split else ''} under logs/. "
+                 "Run `uv run evaluate` first.")
     return runs[-1]
+
+
+def label_of(run_dir: Path) -> str:
+    path = run_dir / "label.txt"
+    return path.read_text().strip() if path.exists() else ""
+
+
+def previous_version(run_b: Path, split: str) -> Path | None:
+    """The run to compare `run_b` against: the latest earlier run (with this split) whose
+    label differs from run_b's, so reruns of the same version are skipped. Falls back to
+    the immediately preceding run when labels are missing."""
+    earlier = [p for p in all_runs(split) if p.name < run_b.name]
+    if not earlier:
+        return None
+    label_b = label_of(run_b)
+    if label_b:
+        for p in reversed(earlier):
+            if label_of(p) and label_of(p) != label_b:
+                return p
+    return earlier[-1]
 
 
 def load_dataset(split: str) -> list[dict[str, str]]:
@@ -353,6 +388,25 @@ def _row_strings(df: pl.DataFrame, cols: list[str]) -> list[tuple[str, ...]]:
 # =============================================================================
 
 
+def diagnoses(
+    run_dir: Path, split: str, traces: list[dict[str, Any]] | None = None
+) -> dict[str, dict[str, str]]:
+    """Diagnosis per trace id, cached in RUN_DIR/debug/summary_<split>.json."""
+    traces = load_traces(run_dir, split) if traces is None else traces
+    cache_path = run_dir / "debug" / f"summary_{split}.json"
+    cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+    dirty = False
+    for t in traces:
+        if t["trace_id"] not in cache:
+            d, _, _ = diagnose(t)
+            cache[t["trace_id"]] = {"category": d.category, "detail": d.detail}
+            dirty = True
+    if dirty:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, indent=2))
+    return cache
+
+
 def cmd_summary(run_dir: Path, splits: list[str], label: str | None) -> None:
     if label:
         (run_dir / "label.txt").write_text(label + "\n")
@@ -361,30 +415,15 @@ def cmd_summary(run_dir: Path, splits: list[str], label: str | None) -> None:
         if not traces:
             continue
         console = make_console()
-        cache_path = run_dir / "debug" / f"summary_{split}.json"
-        cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
-
-        rows = []
-        for t in traces:
-            tid = t["trace_id"]
-            if tid in cache:
-                diag = cache[tid]
-            else:
-                d, _, _ = diagnose(t)
-                diag = {"category": d.category, "detail": d.detail}
-                cache[tid] = diag
-            rows.append((t, diag))
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, indent=2))
+        diags = diagnoses(run_dir, split, traces)
+        rows = [(t, diags[t["trace_id"]]) for t in traces]
 
         n = len(traces)
         passed = sum(1 for t in traces if t["result"]["passed"])
         p_tok = sum(usage_of(t)[0] for t in traces)
         c_tok = sum(usage_of(t)[1] for t in traces)
         avg_turns = sum(turns_of(t) for t in traces) / n
-        label_txt = (run_dir / "label.txt").read_text().strip() if (
-            run_dir / "label.txt"
-        ).exists() else "-"
+        label_txt = label_of(run_dir) or "-"
 
         console.rule(f"[bold]{run_dir.name} / {split}  (label: {label_txt})")
         console.print(
@@ -628,25 +667,34 @@ def cmd_history() -> None:
 
 
 def _diag_map(run_dir: Path, split: str) -> dict[int, tuple[bool, str]]:
-    cache_path = run_dir / "debug" / f"summary_{split}.json"
-    cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
-    out = {}
-    for t in load_traces(run_dir, split):
-        cat = cache.get(t["trace_id"], {}).get("category")
-        if cat is None:
-            cat = "PASS" if t["result"]["passed"] else t["result"]["failure_type"]
-        out[t["_index"]] = (t["result"]["passed"], cat)
-    return out
+    traces = load_traces(run_dir, split)
+    diags = diagnoses(run_dir, split, traces)
+    return {
+        t["_index"]: (t["result"]["passed"], diags[t["trace_id"]]["category"]) for t in traces
+    }
 
 
-def cmd_diff(run_a: Path, run_b: Path, splits: list[str]) -> None:
+def cmd_diff(run_a: Path | None, run_b: Path | None, splits: list[str]) -> None:
+    """Compare two runs. Unspecified runs are picked per split: B = latest run with that
+    split, A = the previous *version* of B (see previous_version)."""
     console = make_console()
+    saved_to: Path | None = None
     for split in splits:
-        a, b = _diag_map(run_a, split), _diag_map(run_b, split)
-        if not a or not b:
+        if not all_runs(split):
             continue
+        b_dir = run_b or latest_run(split)
+        a_dir = run_a or previous_version(b_dir, split)
+        if a_dir is None:
+            console.print(f"[dim]{split}: no earlier run to compare with {b_dir.name}[/dim]")
+            continue
+        a, b = _diag_map(a_dir, split), _diag_map(b_dir, split)
+        if not a or not b:
+            console.print(f"[dim]{split}: missing traces in {a_dir.name} or {b_dir.name}[/dim]")
+            continue
+        saved_to = b_dir
         prompts = {i: item["prompt"] for i, item in enumerate(load_dataset(split))}
-        console.rule(f"[bold]{split}: {run_a.name} → {run_b.name}")
+        la, lb = label_of(a_dir) or "unlabeled", label_of(b_dir) or "unlabeled"
+        console.rule(f"[bold]{split}: {a_dir.name} ({la}) → {b_dir.name} ({lb})")
         pa, pb = sum(v[0] for v in a.values()), sum(v[0] for v in b.values())
         console.print(f"passed {pa} → {pb}  ({pb - pa:+d})")
         groups = [
@@ -660,7 +708,8 @@ def cmd_diff(run_a: Path, run_b: Path, splits: list[str]) -> None:
             for i in ids:
                 console.print(f"  #{i:<3} {a[i][1]:<15} → {b[i][1]:<15} "
                               f"{escape(_short(prompts.get(i, ''), 100))}")
-    save(console, run_b / "debug" / f"diff_vs_{run_a.name}.txt")
+    if saved_to is not None:
+        save(console, saved_to / "debug" / "diff.txt")
 
 
 # =============================================================================
@@ -668,9 +717,9 @@ def cmd_diff(run_a: Path, run_b: Path, splits: list[str]) -> None:
 # =============================================================================
 
 
-def _resolve_run(arg: str | None) -> Path:
+def _resolve_run(arg: str | None, split: str | None = None) -> Path:
     if not arg:
-        return latest_run()
+        return latest_run(split)
     p = Path(arg)
     if not p.is_absolute():
         p = (REPO / p) if (REPO / p).exists() else (LOGS / arg)
@@ -701,21 +750,31 @@ def main() -> None:
 
     sub.add_parser("history", help="pass rates of every run under logs/")
 
-    dfp = sub.add_parser("diff", help="compare two runs case by case")
-    dfp.add_argument("run_a")
-    dfp.add_argument("run_b")
+    dfp = sub.add_parser(
+        "diff",
+        help="compare two runs case by case. No args: latest run vs the previous version "
+        "(latest earlier run with a different --label). One arg: that run vs its previous "
+        "version. Two args: RUN_A → RUN_B.",
+    )
+    dfp.add_argument("runs", nargs="*", help="[RUN_A] [RUN_B]")
     dfp.add_argument("--split", choices=["easy", "hard", "both"], default="both")
 
     a = ap.parse_args()
     if a.cmd == "summary":
-        cmd_summary(_resolve_run(a.run), _splits(a.split), a.label)
+        split = None if a.split == "both" else f"evals_{a.split}"
+        cmd_summary(_resolve_run(a.run, split), _splits(a.split), a.label)
     elif a.cmd == "case":
         run, key = (a.args[0], a.args[1]) if len(a.args) > 1 else (None, a.args[0])
-        cmd_case(_resolve_run(run), f"evals_{a.split}", key, a.thinking)
+        split = f"evals_{a.split}"
+        cmd_case(_resolve_run(run, split), split, key, a.thinking)
     elif a.cmd == "history":
         cmd_history()
     elif a.cmd == "diff":
-        cmd_diff(_resolve_run(a.run_a), _resolve_run(a.run_b), _splits(a.split))
+        if len(a.runs) > 2:
+            sys.exit("diff takes at most two runs: [RUN_A] [RUN_B]")
+        run_a = _resolve_run(a.runs[0]) if len(a.runs) == 2 else None
+        run_b = _resolve_run(a.runs[-1]) if a.runs else None
+        cmd_diff(run_a, run_b, _splits(a.split))
 
 
 if __name__ == "__main__":

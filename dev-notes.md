@@ -35,11 +35,14 @@ uv run evaluate --api-key "$KEY" --split hard --concurrency 16
 # add -v for per-case failure details (gold vs submitted dataframes)
 # traces: logs/run_<UTC timestamp>/evals_{easy,hard}/<uuid>.json
 
-# debug tool (after each eval run); RUN_DIR defaults to the latest logs/run_*
-uv run python scripts/debug_eval.py summary [RUN_DIR] --label vN   # diagnose every case
-uv run python scripts/debug_eval.py case [RUN_DIR] <#> --split hard [--thinking]
-uv run python scripts/debug_eval.py history                        # all runs, pass rates
-uv run python scripts/debug_eval.py diff RUN_A RUN_B --split hard  # fixed / regressed
+# debug tool (after each eval run). No paths needed: everything defaults to the latest
+# run that contains the split.
+uv run python scripts/debug_eval.py summary --label vN    # diagnose every case + tag version
+uv run python scripts/debug_eval.py case <#> [--split easy] [--thinking]
+uv run python scripts/debug_eval.py diff                  # latest vs previous *version*
+uv run python scripts/debug_eval.py history               # all runs, pass rates
+# diff auto-pick: B = latest run, A = latest earlier run with a different label (per
+# split). That is why --label matters. Explicit: diff RUN_B / diff RUN_A RUN_B.
 # reports are also saved to RUN_DIR/debug/ (logs/ is gitignored = local history)
 
 # checks (run before each commit)
