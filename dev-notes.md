@@ -61,7 +61,10 @@ change.
 | v0 baseline | d76b1c9 | 7/64 (10.9%) | 0/64 (0.0%) | easy 20k/27k, hard 23k/25k | `run_20261125_061236`, `run_20261125_061608` |
 | v0 + error handling | 892af65 | not run separately | — | — | Validated as part of v1 |
 | v1 tools + tool-call stream fix | 0a0e8ca | 57/64 (89.1%) | 20/64 (31.2%) | easy 1.55M/113k, hard 1.64M/84k | `run_20261125_070338` |
-| v2 guide index + read/search guides | TBD | 54/64 (84.4%) | 51/64 (79.7%) | easy 2.35M/103k, hard 2.68M/92k | `run_20261125_080612` |
+| v2 guide index + read/search guides | 616d773 | 54/64 (84.4%) | 51/64 (79.7%) | easy 2.35M/103k, hard 2.68M/92k | `run_20261125_080612` |
+| infra: max_tokens 16k, in-flight 402 retry | 35b99ca | — | — | — | (3 invalid 402 runs deleted) |
+| v3a submit validation, full guides in search, SQL pitfalls | 0b7a913 | 55/64 (85.9%) | 52/64 (81.2%) | easy 2.23M/100k, hard 2.83M/100k | `run_20261125_084027` |
+| v3b schema-linked guides in describe_table + prompt rules | TBD | not run | 55/64 (85.9%) | hard 2.88M/102k | `run_20261125_213950` |
 
 ---
 
@@ -562,7 +565,65 @@ Split into two steps so each kind of change can be measured on its own:
   applied it partly (e.g. #7 missed `status = 'A'` for "performing"). None is clearly
   caused by a v3a mechanism. They look like run-to-run variance in *whether and how* the
   agent uses guides.
-- v3b: TBD
+- v3b: see below.
+
+### v3b — structural guide exposure + prompt rules (implemented, evaluated on hard)
+
+Redesigned after the v3a result. The originally planned prompt-only items (③⑤⑥) would
+not address the main v3a failure mode: the agent *sometimes* not consulting a guide at
+all. v3b makes guide exposure structural, and adds the prompt items as short rules.
+
+- `tools/guide_tools.py::guides_for_schema(schema)`: a guide is linked to a schema if
+  its title names the schema (case-insensitive word match, e.g. "(Credit Database)",
+  "Financial Database ...") or its body references a schema-qualified table
+  (`Credit.charge`). Inferred from the guides, with no hand-written map.
+  - Validated: all 12 eval schemas link to exactly their guide, with no false links.
+  - Plain word matching was rejected: "Credit", "world", and "financial" matched 6–8
+    unrelated guides.
+- `list_schemas` tags each schema with its linked guide (`[guide: ...]`), about +200
+  tokens. This helps choose among look-alike schemas (Credit vs ccs, financial vs cs).
+- `describe_table` appends the full text of the guide(s) linked to the described
+  schemas (~650 tokens for the credit guide). The agent calls `describe_table` in
+  nearly every episode right after choosing a schema, so it now always sees the rules.
+  Trade-off: if `describe_table` is called several times, the guide is attached each
+  time (tools are stateless).
+- Prompt (guide `prompt_context`):
+  - ⑤ prefer the schema whose linked guide covers the domain;
+  - ⑥ when the question defines a term, use it verbatim and add no guide qualifiers;
+  - ③ before submitting, list every defined term and the SQL clause that implements it.
+- Tests: `guides_for_schema` linking, `describe_table` attachment, `list_schemas` tag
+  (15 tests pass).
+- Smoke test on 4 v3a hard regressions (#21, #22, #24 never consulted a guide; #7 applied
+  it partly): **4/4 PASS** (n=1 each). None of the 4 called `read_guide` or
+  `search_guides`; the rules arrived via `describe_table`.
+
+#### v3b result (hard only, to save budget)
+- **Hard: 55/64 (85.9%)**, up from 52/64 in v3a: 7 fixed, 4 regressed.
+  Run `run_20261125_213950`. Tokens 2.88M in / 0.10M out, about the same as v3a
+  (2.83M), so the attached guides did not raise cost noticeably.
+- **Guide exposure is now structural:** 63 of 64 traces contain an auto-attached
+  guide. All 3 "never consulted a guide" regressions from v3a (#21, #22, #24) pass.
+- Remaining 9 failures. In every one of them the rules were in the context:
+
+| Case | Diagnosis | What went wrong |
+|---|---|---|
+| #0, #53 (airline) | VALUES_DIFFER | Guide attached, but the agent still omits "completed = DepTime and ArrTime present". It filters only `Cancelled = 0`, or uses `ArrDelayMinutes IS NOT NULL`. |
+| #3 (avg transaction value) | WRONG_SCHEMA | The question names no domain. The agent picks `financial.trans`; gold uses `Credit.charge`. Genuinely ambiguous wording. |
+| #6 (account volume) | WRONG_SCHEMA | Picked `cs` (no linked guide) over `financial` (tagged). The schema tag did not override the look-alike table names. |
+| #7 (Eastern Region loans) | VALUES_DIFFER | Missed `status = 'A'` ("performing") despite the attached guide and the checklist rule. |
+| #27 (accidents) | VALUES_DIFFER | Joined the lookup table and lost rows, against the guide's "do not join" note. |
+| #36 (F1 starts) | VALUES_DIFFER | Used `qualifying` instead of `results` + `status` exclusions. |
+| #41 (statement net) | VALUES_DIFFER | Did not restrict to `Credit.statement` numbers. |
+| #59 (starting pitchers) | VALUES_DIFFER | Top-50 membership differs. Its filter variant differs subtly from gold. |
+
+#### Stability across v2, v3a, v3b (hard, 3 runs)
+- **Always pass: 41/64.** Always fail: **3** (#0, #3, #53). Fail in 2 of 3: 5 (#6, #7,
+  #20, #41, #49). **Fail in 1 of 3 ("flaky"): 15.**
+- So ~20 cases are flaky and only 3 are hard failures. The ceiling with the current
+  design is high, and the main lever left is consistency.
+- Caveat: these are different versions, not repeated runs of one version. Some flips
+  are real effects (e.g. #21/#22/#24 fixed by v3b), but most of the 1-of-3 group looks
+  like noise.
 
 ### Key finding: run-to-run variance now dominates
 - Between v2 and v3a, 15 of 64 hard cases flipped (8 fixed, 7 regressed) for a net of +1.

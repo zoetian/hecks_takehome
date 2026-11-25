@@ -16,6 +16,7 @@ import polars as pl
 
 from framework.agent import Tool
 from framework.database import DATABASE_PATH
+from tools.guide_tools import guides_for_schema, read_guide
 
 # Output budgets: keep tool results small enough that many calls fit in context.
 _PREVIEW_ROWS = 20
@@ -74,9 +75,15 @@ def list_schemas() -> str:
         ).fetchall()
     finally:
         conn.close()
-    lines = [f"{schema}: {', '.join(tables)}" for schema, tables in rows]
+    lines = []
+    for schema, tables in rows:
+        # v3b: mark schemas that have a linked business-rule guide (cheap: a few tokens),
+        # which helps pick the right one among look-alike schemas.
+        linked = guides_for_schema(schema)
+        tag = f"  [guide: {', '.join(linked)}]" if linked else ""
+        lines.append(f"{schema}: {', '.join(tables)}{tag}")
     return (
-        f"{len(rows)} schemas (format 'schema: table, table, ...'). "
+        f"{len(rows)} schemas (format 'schema: table, table, ...  [guide: linked guide]'). "
         "Reference tables as schema.table; identifiers are case-sensitive when quoted.\n"
         + "\n".join(lines)
     )
@@ -150,7 +157,34 @@ def describe_table(tables: list[str]) -> str:
                 parts.append(f"## {t}\nDuckDB error: {e}")
     finally:
         conn.close()
-    return notes + "\n\n".join(parts)
+    return notes + "\n\n".join(parts) + _linked_guides_section(tables)
+
+
+def _linked_guides_section(tables: list[str]) -> str:
+    """v3b: attach the full text of guides linked to the described schemas.
+
+    In v3a, 3 of 7 hard regressions never consulted any guide in that run, although
+    they passed when they did. Whether the agent reads the guide was stochastic.
+    describe_table is called in nearly every episode right after choosing a schema, so
+    attaching the linked guide here makes guide exposure structural, not optional.
+    """
+    schemas = []
+    for t in tables:
+        schema = t.split(".", 1)[0].strip().strip('"') if "." in t else ""
+        if schema and schema not in schemas:
+            schemas.append(schema)
+    names: list[str] = []
+    for schema in schemas:
+        for name in guides_for_schema(schema):
+            if name not in names:
+                names.append(name)
+    if not names:
+        return ""
+    return (
+        "\n\n---\nBusiness-rule guide(s) linked to "
+        f"{', '.join(schemas)} (auto-attached; these definitions are authoritative, "
+        "apply the ones relevant to the question):\n\n" + read_guide(names)
+    )
 
 
 DESCRIBE_TABLE: Tool = Tool(
@@ -158,7 +192,8 @@ DESCRIBE_TABLE: Tool = Tool(
     description=(
         "Describe one or more tables: column names and types, row count, and a few "
         "sample rows (useful for seeing how values are actually encoded). Pass several "
-        "tables at once to save steps."
+        "tables at once to save steps. Also attaches the business-rule guide linked to "
+        "the tables' schema, if any."
     ),
     parameters={
         "type": "object",

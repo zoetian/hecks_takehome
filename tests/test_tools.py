@@ -25,3 +25,20 @@ def test_submit_answer_rejects_failing_query() -> None:
 def test_search_guides_includes_full_guide_text() -> None:
     out = search_guides("legacy workforce")
     assert "===== guide:" in out  # full text appended, not only matching lines
+
+
+def test_guides_for_schema_links_by_title_or_qualified_table() -> None:
+    from tools.guide_tools import guides_for_schema
+
+    assert guides_for_schema("Credit") == ("credit_card_operations",)
+    assert guides_for_schema("financial") == ("financial_operations",)  # title "Financial ..."
+    assert guides_for_schema("no_such_schema") == ()
+
+
+@needs_db
+def test_describe_table_attaches_linked_guide_and_list_schemas_tags_it() -> None:
+    from tools.database_tools import describe_table, list_schemas
+
+    out = describe_table(["Credit.charge"])
+    assert "===== guide: credit_card_operations =====" in out
+    assert "[guide: credit_card_operations]" in list_schemas()

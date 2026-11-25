@@ -18,6 +18,7 @@ Everything is derived from whatever markdown files are in the guides directory; 
 is specific to these guides. Override the location with HECKS_GUIDES_DIR.
 """
 
+import functools
 import math
 import os
 import re
@@ -55,6 +56,26 @@ def _title_and_sections(text: str) -> tuple[str, list[str]]:
         elif len(m.group(1)) > 1:
             sections.append(m.group(2))
     return title, sections
+
+
+@functools.cache
+def guides_for_schema(schema: str) -> tuple[str, ...]:
+    """Guides linked to a database schema, inferred from the guide text itself.
+
+    v3b: a guide is linked if its title names the schema (e.g. "(Credit Database)"), or
+    its body references a schema-qualified table (e.g. "Credit.charge"). On this
+    warehouse this links all 12 schemas used by the evals to exactly their guide, with
+    no false links, and it needs no hand-maintained mapping.
+    """
+    pattern_title = re.compile(rf"\b{re.escape(schema)}\b", re.IGNORECASE)
+    pattern_table = re.compile(rf"\b{re.escape(schema)}\.[A-Za-z_]", re.IGNORECASE)
+    linked = []
+    for name, path in _guide_files().items():
+        text = path.read_text()
+        title = text.splitlines()[0] if text else ""
+        if pattern_title.search(title) or pattern_table.search(text):
+            linked.append(name)
+    return tuple(linked)
 
 
 def build_guide_index() -> str:
@@ -106,16 +127,28 @@ def _prompt_context() -> str | None:
         "definitions. These are authoritative: when a guide defines a term (e.g. what "
         "counts as 'completed', 'active', 'performing', 'legacy'), use the guide's "
         "definition instead of a conventional one.\n"
-        "- Before writing SQL, find the guide(s) for the schema/domain in the index below "
-        "and read them in full with read_guide. Guide titles often name their database, "
-        "which also helps pick the right schema among look-alikes.\n"
+        "- list_schemas marks which guide is linked to each schema, and describe_table "
+        "automatically attaches the full text of the guide(s) linked to the schema you "
+        "describe. If no guide is attached, look for one in the index below (read_guide) "
+        "or with search_guides.\n"
+        # v3b: schema disambiguation (v2/v3a: Credit vs financial vs ccs/cs mix-ups).
+        "- Several schemas can look alike. Prefer the schema that has a linked guide "
+        "covering the question's domain, and check that its columns match the vocabulary "
+        "the guide uses.\n"
         "- Apply only the rules that bear on the terms, filters, and metrics in the "
         "question. Guides also contain rules unrelated to the question; do not apply those.\n"
         "- Pay special attention to sections that give precise definitions or the scope "
         "of the data (e.g. 'definitions', 'scope', 'aggregation').\n"
-        "- If the question's own wording explicitly conflicts with a guide, follow the "
-        "question.\n"
-        "- Use search_guides to look up a term when you are unsure which guide defines it.\n\n"
+        # v3b: question wins verbatim (v2 easy #40 added a guide qualifier to a term the
+        # question had already defined).
+        "- When the question itself defines a term or filter, use the question's "
+        "definition exactly and do not add guide qualifiers to it. Use guide definitions "
+        "for terms the question uses without defining.\n"
+        # v3b: rule checklist (v2/v3a: guide read but applied only partly, e.g. missing
+        # status = 'A' for "performing").
+        "- Before calling submit_answer, list in your reasoning every term in the question "
+        "that the guide (or question) defines, and the SQL clause that implements each "
+        "one (filter, join, CASE, grouping key, denominator). Add any that are missing.\n\n"
         "Guide index (name: title | sections):\n" + index
     )
 
