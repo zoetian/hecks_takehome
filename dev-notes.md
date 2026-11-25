@@ -64,7 +64,8 @@ change.
 | v2 guide index + read/search guides | 616d773 | 54/64 (84.4%) | 51/64 (79.7%) | easy 2.35M/103k, hard 2.68M/92k | `run_20261125_080612` |
 | infra: max_tokens 16k, in-flight 402 retry | 35b99ca | — | — | — | (3 invalid 402 runs deleted) |
 | v3a submit validation, full guides in search, SQL pitfalls | 0b7a913 | 55/64 (85.9%) | 52/64 (81.2%) | easy 2.23M/100k, hard 2.83M/100k | `run_20261125_084027` |
-| v3b schema-linked guides in describe_table + prompt rules | TBD | not run | 55/64 (85.9%) | hard 2.88M/102k | `run_20261125_213950` |
+| v3b schema-linked guides in describe_table + prompt rules | 574a340 | not run | 55/64 (85.9%) | hard 2.88M/102k | `run_20261125_213950` |
+| v4 temperature 0.6 → 0.2 (2 runs) | TBD | not run | 58/64, 52/64 (mean 85.9%) | hard 2.53M/98k, 2.44M/93k | `run_20261125_215541`, `_215659` |
 
 ---
 
@@ -667,11 +668,74 @@ all. v3b makes guide exposure structural, and adds the prompt items as short rul
 
 ---
 
+## v4 — Lower sampling temperature (implemented, evaluated: 2 hard runs)
+
+### Current result
+- v3b: hard 55/64 (85.9%).
+
+### Findings (motivating v4)
+- Stability across v2/v3a/v3b: 41 always pass, 3 always fail, ~20 flip. Most remaining
+  error is sampling variance, not missing capability.
+- In v3b every failure had the rules in context. The model sometimes applies them and
+  sometimes not.
+
+### Change
+- `framework/llm.py`: `temperature` default 0.6 → **0.2**. This is the only change, so
+  its effect is isolated.
+  - Not 0.0: greedy decoding can make reasoning models loop or repeat.
+  - The model, tools, and prompt are unchanged.
+
+### Hypothesis / what to look for
+- Fewer flips. The "flaky" cases should settle, ideally on PASS where the agent's most
+  likely behavior is correct.
+- Risk: lower temperature also freezes *wrong* habits. A case whose most likely path is
+  wrong (e.g. #0/#53 dropping the "completed" rule) becomes consistently wrong, and
+  "lucky" passes disappear. Net effect is an empirical question.
+- Proper measurement needs ≥2 runs at the same version (flip rate within a version).
+  One run vs v3b mixes version effects with noise.
+
+### Result after change (2 hard runs, same code)
+- **Run 1 (`run_20261125_215541`): 58/64 (90.6%). Run 2 (`run_20261125_215659`): 52/64
+  (81.2%). Mean 55.0/64 (85.9%)**, identical to v3b's single run. Zero infra errors in
+  either run. The two runs were started ~78 s apart and ran concurrently (32 workers in
+  total). In-flight 402s, if any, were retried.
+- **Within-version flips: 10/64** (8 pass only in run 1, 2 pass only in run 2). This is
+  our first direct measurement of run-to-run noise at a fixed version. Even at
+  temperature 0.2 a single hard run has a spread of roughly ±3–5 cases.
+- Run 2 failed 4 cases that passed in all 4 earlier runs (#13, #48, #50, #56):
+  - #13 submitted untested SQL that returned **0 rows**. Pre-submit validation only
+    rejects errors, not empty results.
+  - #56 used `charge_code <> 'RF'` again (NULL pitfall) despite the prompt rule.
+  - #48 grouped by brewery id instead of name (ambiguous grain).
+  - #50 used a subtly different join.
+- Consistent failures across all 5 runs (v2, v3a, v3b, v4 ×2): **#0, #3**. #7 fails in
+  4 of 5.
+
+### Interpretation
+- No measurable gain from temperature 0.2 at this sample size (mean 55.0 vs 55). The
+  10-flip spread shows that variance is not only sampling temperature. Plausible
+  additional sources (not verified):
+  - `:nitro` routes to whichever provider is fastest at that moment, and providers can
+    differ numerically.
+  - Long multi-turn trajectories amplify small early differences.
+- We keep 0.2. It is no worse on the mean, theory favors it for repeatability, and the
+  report should state "no measurable effect" honestly.
+- Reporting implication: compare versions on means over ≥2 runs. **Single-run deltas
+  below ~5 cases are not evidence.**
+- Generic failure modes still visible:
+  1. Submitting a 0-row result without testing. A candidate fix is a stateless
+     `allow_empty` flag on `submit_answer`, so 0-row results are rejected unless
+     explicitly confirmed.
+  2. The NULL `<>` pitfall persists as a prompt-only rule. A candidate fix is a
+     validator that flags `col <> 'literal'` on nullable columns.
+
+---
+
 ## Later iterations (sketch)
 
 | Ver | Change | Target |
 |-----|--------|--------|
-| v4 | Leftovers after v3: loop and iteration control (max-iteration failures); reasoning effort; `first_token_timeout` check (deferred until ~70%, now reached); context compression for token cost | Hard → 85–90% |
+| v5 (candidates) | Reasoning effort `high` (targets "rules in context but misapplied"; output tokens are only ~3% of cost); `first_token_timeout` check (deferred until ~70%, now reached); context compression for token cost; final full both-split run | Hard → 85–90% stable |
 
 Noise: temperature 0.6 and 64 cases (1 case ≈ 1.6%). Run key versions ≥2 times and
 report a range.

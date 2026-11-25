@@ -145,7 +145,12 @@ class OpenRouterConfig:
     # in_flight_budget_exhausted on ~95% of requests). Observed completions per
     # generation in v2: median 169, p99 945, max 1,563. 16k leaves 10x headroom.
     max_tokens: int = 16384
-    temperature: float = 0.6
+    # v4: was 0.6. Across v2/v3a/v3b, ~20 of 64 hard cases flipped between pass and fail
+    # while only 3 failed consistently, so sampling variance is the largest remaining
+    # source of error. Lower temperature makes the agent's choices (which guide rule to
+    # apply, which table to use) more repeatable. We avoid 0.0, which can cause
+    # repetition loops in reasoning models.
+    temperature: float = 0.2
     max_iterations: int = 30
     # Provider routing - no restriction by default
     provider: dict[str, Any] = field(default_factory=dict)
