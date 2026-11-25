@@ -66,7 +66,8 @@ change.
 | v3a submit validation, full guides in search, SQL pitfalls | 0b7a913 | 55/64 (85.9%) | 52/64 (81.2%) | easy 2.23M/100k, hard 2.83M/100k | `run_20261125_084027` |
 | v3b schema-linked guides in describe_table + prompt rules | 574a340 | not run | 55/64 (85.9%) | hard 2.88M/102k | `run_20261125_213950` |
 | v4 temperature 0.6 → 0.2 (2 runs) | 6ac44f7 | not run | 58/64, 52/64 (mean 85.9%) | hard 2.53M/98k, 2.44M/93k | `run_20261125_215541`, `_215659` |
-| v5 pre-submit NULL/empty lint with confirmation code (2 runs) | TBD | not run | 54/64, 52/64 (mean 82.8%) | hard 2.56M/92k, 2.99M/104k | `run_20261125_221127`, `_221513` |
+| v5 pre-submit NULL/empty lint with confirmation code (2 runs) | a521949 | not run | 54/64, 52/64 (mean 82.8%) | hard 2.56M/92k, 2.99M/104k | `run_20261125_221127`, `_221513` |
+| **final** (v5 code, both splits) | a521949 | **60/64 (93.8%)** | **56/64 (87.5%)** | easy 2.21M/100k, hard 2.82M/97k | `run_20261125_221943` |
 
 ---
 
@@ -809,6 +810,28 @@ Two generic "runs fine, silently wrong" patterns from v4 run 2:
 - Keep v5: it is generic, safe (0/64 gold flagged; it never pushed the agent off a
   correct answer), and cheap. Report it as a defensive check with no measurable
   effect at this sample size.
+
+---
+
+## Final run (v5 code, both splits)
+
+- `run_20261125_221943`, label `final`, terminal output in `logs/eval_final.log`.
+- **Easy 60/64 (93.8%), hard 56/64 (87.5%).** Zero infra errors and no 402s. Tokens
+  5.03M in / 0.20M out. The hard score sits in the upper half of the 52–58 single-run
+  range observed for v3b–v5, consistent with the ~84.7% multi-run mean.
+- Easy failures: **#0, #3, #7, #53**. Hard failures: #0, #3, #5, #7, #12, #48, #51
+  (MAX_ITERATIONS, the same repetition loop seen in v5 run 1), and #53.
+- **Key finding: the 4 easy failures are exactly the 4 cases that fail in ≥5 of 7 hard
+  runs.** In easy these rules are written into the question itself, so these failures
+  are *not* retrieval problems. The model does not translate a known rule into the
+  right SQL:
+  - #0, #53: "completed = DepTime and ArrTime present" is dropped.
+  - #7: "performing = status A" is dropped in an aggregate.
+  - #3: the bare question "average transaction value" maps to the wrong look-alike
+    schema.
+  So guide retrieval is essentially solved for this set. The remaining ceiling is rule
+  *application* and schema ambiguity, which points to reasoning effort or
+  self-verification as the next levers, not more retrieval.
 
 ---
 
