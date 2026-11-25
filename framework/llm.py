@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 from tenacity import (
+    RetryCallState,
     Retrying,
     retry_if_exception,
     stop_after_attempt,
@@ -37,9 +38,59 @@ def _is_read_timeout_error(exception: BaseException) -> bool:
     return isinstance(exception, httpx.ReadTimeout)
 
 
+# v0: fix provider error handling under concurrency.
+# Transient upstream/provider errors (OpenRouter surfaces
+# some of these as 400) rather than a malformed request, so we retry them along
+# with 408 and 5xx. Requests that are genuinely bad still fail after the retry
+# budget, and the response body is now included in the error (see
+# _raise_for_status_with_body) so the cause shows up in eval traces.
+_RETRYABLE_STATUS_CODES = {400, 408, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_status_error(exception: BaseException) -> bool:
+    """Check if the exception is an HTTP error with a retryable status code."""
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code in _RETRYABLE_STATUS_CODES
+    return False
+
+
 def _is_retryable_error(exception: BaseException) -> bool:
-    """Check if the exception is retryable (rate limit or read timeout)."""
-    return _is_rate_limit_error(exception) or _is_read_timeout_error(exception)
+    """Check if the exception is retryable (retryable HTTP status or read timeout)."""
+    return (
+        _is_rate_limit_error(exception)
+        or _is_retryable_status_error(exception)
+        or _is_read_timeout_error(exception)
+    )
+
+
+def _log_retry(retry_state: RetryCallState) -> None:
+    """Log each retry so transient provider errors are visible on stderr."""
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    _logger.warning(
+        "OpenRouter request failed (attempt %d), retrying: %s",
+        retry_state.attempt_number,
+        str(exc).splitlines()[0] if exc else "unknown error",
+    )
+
+
+def _raise_for_status_with_body(response: httpx.Response) -> None:
+    """Like response.raise_for_status(), but include the response body in the message.
+
+    v0: the default error message drops the body, which hid why OpenRouter
+    returned 400 in the baseline run.
+    """
+    if response.is_success:
+        return
+    try:
+        body = response.read().decode("utf-8", errors="replace")[:1000]
+    except Exception:
+        body = "<unreadable body>"
+    raise httpx.HTTPStatusError(
+        f"HTTP {response.status_code} from OpenRouter: {body}",
+        request=response.request,
+        response=response,
+    )
 
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -171,6 +222,7 @@ class OpenRouterClient:
             retry=retry_if_exception(_is_retryable_error),
             stop=stop_after_attempt(5),
             wait=wait_exponential(multiplier=1, min=1, max=60),
+            before_sleep=_log_retry,  # v0: make provider retries visible
             reraise=True,
         )
 
@@ -180,7 +232,8 @@ class OpenRouterClient:
                     with self._client.stream(
                         "POST", OPENROUTER_API_URL, json=body
                     ) as response:
-                        response.raise_for_status()
+                        # v0: keep the error body (was response.raise_for_status())
+                        _raise_for_status_with_body(response)
 
                         # Accumulated tool call data (streamed incrementally)
                         tool_calls_buffer: dict[int, dict[str, Any]] = {}
