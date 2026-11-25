@@ -65,7 +65,8 @@ change.
 | infra: max_tokens 16k, in-flight 402 retry | 35b99ca | — | — | — | (3 invalid 402 runs deleted) |
 | v3a submit validation, full guides in search, SQL pitfalls | 0b7a913 | 55/64 (85.9%) | 52/64 (81.2%) | easy 2.23M/100k, hard 2.83M/100k | `run_20261125_084027` |
 | v3b schema-linked guides in describe_table + prompt rules | 574a340 | not run | 55/64 (85.9%) | hard 2.88M/102k | `run_20261125_213950` |
-| v4 temperature 0.6 → 0.2 (2 runs) | TBD | not run | 58/64, 52/64 (mean 85.9%) | hard 2.53M/98k, 2.44M/93k | `run_20261125_215541`, `_215659` |
+| v4 temperature 0.6 → 0.2 (2 runs) | 6ac44f7 | not run | 58/64, 52/64 (mean 85.9%) | hard 2.53M/98k, 2.44M/93k | `run_20261125_215541`, `_215659` |
+| v5 pre-submit NULL/empty lint with confirmation code (2 runs) | TBD | not run | 54/64, 52/64 (mean 82.8%) | hard 2.56M/92k, 2.99M/104k | `run_20261125_221127`, `_221513` |
 
 ---
 
@@ -728,6 +729,86 @@ all. v3b makes guide exposure structural, and adds the prompt items as short rul
      explicitly confirmed.
   2. The NULL `<>` pitfall persists as a prompt-only rule. A candidate fix is a
      validator that flags `col <> 'literal'` on nullable columns.
+
+---
+
+## v5 — Pre-submit lint with confirmation (implemented, evaluated: 2 hard runs)
+
+### Current result
+- v4: hard mean 55.0/64 (85.9%) over 2 runs. Within-version noise is ~10 flips.
+
+### Findings (motivating v5)
+Two generic "runs fine, silently wrong" patterns from v4 run 2:
+- #13 submitted an untested query that returned **0 rows**.
+- #56 used `charge_code <> 'RF'`, which drops NULL codes. A prompt rule about this has
+  existed since v3a, but prompt-only rules are followed stochastically.
+
+### Change
+- New `tools/sql_lint.py::lint_null_comparisons(query)`: uses sqlglot to find
+  `col <> literal`, `col != literal`, and `col NOT IN (...)`. It resolves each column to
+  its table (via aliases, skipping CTEs) and warns only if that column **actually
+  contains NULLs** in the database. The warning text gives the row count and suggests
+  `IS DISTINCT FROM`.
+- `tools/submit_answer.py`: after the v3a error check, warn on NULL-lint hits or a 0-row
+  result. The submission is not accepted until the agent either fixes the query or
+  resubmits with `confirmation_code`, a hash derived from the query that the warning
+  provides. This is not a hard block, because dropping NULLs or an empty answer can be
+  intended.
+  - The first attempt used `confirmed: bool`. In a smoke test the model set
+    `confirmed=true` pre-emptively on its first submit (2/4 runs), which bypassed the
+    check. A code that is only obtainable from the warning fixes that and stays
+    stateless.
+- Offline validation (no API cost):
+  - **0/64 gold queries trigger the NULL lint, and 0/64 gold results are empty**, so the
+    check never pushes back on a correct gold-style answer.
+  - Over all past hard submissions, 10 would be flagged: 7 failed answers and 3 passed
+    answers. The passed ones just need a confirmation.
+  - Only 1 past submission returned 0 rows (#13, failed).
+- Tests: NULL warning → wrong code rejected → correct code accepted; empty-result
+  warning; no warning on a column without NULLs. 18 tests pass.
+- Smoke test after the code fix (#56 ×2, #13 ×2): 3/4 PASS, and no pre-emptive bypass
+  attempts. The lint did not fire in these runs because the model wrote NULL-safe
+  queries. The #13 failure was a non-empty wrong answer.
+
+### Expected effect
+- Small: it targets ~1–3 cases per run. Given ~10-flip noise, 2 runs are needed to
+  separate it from noise.
+
+### Result after change (2 hard runs, run sequentially)
+- **Run 1 (`run_20261125_221127`): 54/64 (84.4%). Run 2 (`run_20261125_221513`): 52/64
+  (81.2%). Mean 53.0/64 (82.8%)**, vs v4 mean 55.0 (58/52). Both versions show 10
+  within-version flips, so the −2 difference is inside the noise. Zero infra errors.
+  Both runs were labeled after the fact (`summary RUN --label v5`).
+- **The lint fired 3 times across the 2 runs and behaved as intended:**
+  - #62: `res.position <> 0` on a column with 10,529 NULLs. The agent judged that
+    excluding NULL positions was intended, resubmitted with the code, and **passed**.
+    The check did not push it off a correct answer.
+  - #56: `charge_code <> 'RF'`. The agent confirmed with the code and passed.
+  - #3: `k_symbol <> 'UROK'`. The agent rewrote the query, but #3 fails regardless
+    (wrong schema).
+  - The empty-result warning never fired.
+  - **No measurable effect on pass rate, and no harm observed.**
+- The one non-mismatch failure (run 1, MAX_ITERATIONS) is unrelated to v5. It is a
+  **repetition loop**: the agent picked `Countries` instead of `world`, then ran the
+  same `SELECT DISTINCT "Indicator Name" ... ILIKE '%population%'` 28 times until the
+  30-turn budget ran out. A candidate fix is framework-level detection of identical
+  repeated tool calls.
+
+### Stability over all 7 hard runs (v2, v3a, v3b, v4×2, v5×2)
+- Pass counts: 51, 52, 55, 58, 52, 54, 52.
+- Per case: **33 always pass**. 14 fail once, 7 fail twice, 4 fail three times, 2 fail
+  four times. **Only 4 cases fail ≥5 of 7: #0, #3, #7, #53.**
+  - #0 and #53: airline "completed" definition.
+  - #3: ambiguous domain, wrong schema.
+  - #7: "performing" = status A missed.
+- The mean over the last 5 runs (v3b–v5, all with structural guide exposure) is
+  **54.2/64 (84.7%)**, within the 80–90% target. The practical spread for one run is
+  52–58.
+
+### Decision
+- Keep v5: it is generic, safe (0/64 gold flagged; it never pushed the agent off a
+  correct answer), and cheap. Report it as a defensive check with no measurable
+  effect at this sample size.
 
 ---
 
