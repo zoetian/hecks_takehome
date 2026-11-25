@@ -35,6 +35,13 @@ uv run evaluate --api-key "$KEY" --split hard --concurrency 16
 # add -v for per-case failure details (gold vs submitted dataframes)
 # traces: logs/run_<UTC timestamp>/evals_{easy,hard}/<uuid>.json
 
+# debug tool (after each eval run); RUN_DIR defaults to the latest logs/run_*
+uv run python scripts/debug_eval.py summary [RUN_DIR] --label vN   # diagnose every case
+uv run python scripts/debug_eval.py case [RUN_DIR] <#> --split hard [--thinking]
+uv run python scripts/debug_eval.py history                        # all runs, pass rates
+uv run python scripts/debug_eval.py diff RUN_A RUN_B --split hard  # fixed / regressed
+# reports are also saved to RUN_DIR/debug/ (logs/ is gitignored = local history)
+
 # checks (run before each commit)
 uv run pytest -v                 # unit tests in tests/
 uvx ruff check <changed files>   # lint (config in pyproject.toml [tool.ruff])
@@ -293,6 +300,49 @@ Takeaways:
   submitting, GROUP BY alias shadowing, and runaway exploration loops.
 - `[DEBUG] Empty response detected` appeared ~10 times across both splits. The existing
   continuation prompt handled it. Not a significant failure source.
+
+---
+
+## Tooling — `scripts/debug_eval.py` (between v1 and v2)
+
+Why: the ad-hoc scratch analysis could list failures but not explain them. To debug a
+case you had to diff gold and submitted SQL by hand. We want a repeatable local
+debugger to run after every eval.
+
+Design:
+- Reads trace files only. It re-executes gold and submitted SQL (traces store no
+  dataframes). It never touches `evaluate.py` or the agent.
+- **Auto-diagnosis** per failed case: `WRONG_SCHEMA`, `ROWCOUNT`, `MISSING_COLUMN`,
+  `VALUES_DIFFER` (with the offending gold columns), `ROW_ASSOCIATION`, `SQL_ERROR`,
+  `MAX_ITERATIONS`, `NO_SUBMISSION`, `INFRA`. Column matching reuses the evaluator's own
+  cell normalization and 1e-4 tolerance.
+- **Missing-rules view:** easy and hard share questions and gold queries one-to-one by
+  index (64/64), and 45/64 hard prompts are exact prefixes of the easy prompt. The extra
+  easy text is the rule set the agent should have found in the guides. Debug-only; it is
+  never shown to the agent.
+- **Condition diff:** sqlglot extracts atomic WHERE/HAVING/JOIN-ON predicates from both
+  queries and shows the ones only in gold (missed) and only in submitted (added).
+- **Row diff:** rows present on only one side, with mismatched columns paired by
+  position so the wrong values are visible.
+- **Trajectory:** one line per tool call (args and truncated result), plus optional
+  per-turn model reasoning (`--thinking`).
+- **History:** every report is saved under `RUN_DIR/debug/`. The summary JSON doubles
+  as a diagnosis cache. `history` builds a pass-rate table across all runs on the fly,
+  and `--label` tags a run with its version.
+
+Example (v1, hard #2): diagnosis `VALUES_DIFFER net_charge_volume`; condition diff
+`+ charge_amt <> 0.01`; row diff `3684257.75` vs `3684257.78`. The agent missed the
+"exclude $0.01 test transactions" rule, which is exactly the missing guide rule.
+
+Example (v1, hard #0, `--thinking`): the model spends turns 3–5 guessing whether
+"on-time" means `ArrDelay <= 0` or `<= 15`. It has no source of truth, which is direct
+motivation for v2.
+
+v1 hard diagnosis breakdown (from the tool): VALUES_DIFFER 25, ROWCOUNT 16,
+MAX_ITERATIONS 2, WRONG_SCHEMA 1.
+
+Known limitation: v0's "explore by submitting information_schema" cases show up as
+`WRONG_SCHEMA`.
 
 ---
 
